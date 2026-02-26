@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# virtualenvs
+.venv/
+venv/
+
+# local DB + uploads (use Render disk instead)
+db.sqlite3
+static/uploads/
