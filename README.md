@@ -13,7 +13,7 @@ App runs on `http://localhost:8000` by default.
 
 This repo includes a `render.yaml` blueprint configured for:
 
-- `gunicorn main:app` (binds to Render's `$PORT`)
+- `gunicorn app:app` (binds to Render's `$PORT`)
 - SQLite stored on a persistent disk (`DB_PATH=/var/data/db.sqlite3`)
 - Uploads stored on the same disk (`UPLOAD_FOLDER=/var/data/uploads`)
 
