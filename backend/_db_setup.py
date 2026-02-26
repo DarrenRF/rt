@@ -317,6 +317,9 @@ def init_db():
         """
     )
 
+    # Newer app versions expect an "about" field on user profiles.
+    _ensure_column("user_info", "about", "about TEXT")
+
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS profile_comments (
