@@ -4102,6 +4102,10 @@ html[data-theme='dark'] .rating-form label {
   color: var(--subtle);
 }
 
+html[data-theme='dark'] .rating-form .rating-title {
+  color: var(--ink);
+}
+
 html[data-theme='dark'] .rating-form select,
 html[data-theme='dark'] .rating-form input[type='text'],
 html[data-theme='dark'] .rating-form input[type='url'],
