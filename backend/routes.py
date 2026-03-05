@@ -6,10 +6,17 @@ from flask import (
     flash,
     current_app,
     session,
+    jsonify,
 )
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from urllib.parse import urlsplit, urlunsplit
-from urllib.parse import urlencode
+from urllib.parse import urlencode, quote
+import os
+import time
+import re
+import requests
+import json
+import threading
 from werkzeug.utils import secure_filename
 from pathlib import Path
 from flask_login import login_user, logout_user, login_required, current_user
@@ -85,6 +92,7 @@ from backend.database import (
     set_rating_category_vote,
     get_rating_category_votes_summary,
     get_user_rating_category_votes,
+    get_category_vote_totals_for_ratings,
     get_rating_comments,
     add_rating_comment,
     get_rating_comment,
@@ -92,12 +100,540 @@ from backend.database import (
     delete_rating_comment,
     get_users,
     count_users,
+    get_users_who_rated_same_subject,
+    count_users_who_rated_same_subject,
+    get_subject_activity_timeseries,
+    search_rated_subjects,
+    get_subject_overall_summary,
+    get_rating_reactions_summary,
+    get_user_rating_reactions,
+    toggle_rating_reaction,
+    activity_exists,
+    get_reaction_counts_for_ratings,
 )
 
 # Initialize routes with Blueprint
 # Blueprint is what allows the routes to work (@app.route etc.)
 app = Blueprint("main", __name__)
 
+
+###############################################
+# MusicBrainz
+###############################################
+
+_MB_LAST_CALL_AT: float = 0.0
+_MB_THROTTLE_LOCK = threading.Lock()
+
+_CAA_LAST_CALL_AT: float = 0.0
+_CAA_THROTTLE_LOCK = threading.Lock()
+
+_WIKIDATA_LAST_CALL_AT: float = 0.0
+_WIKIDATA_THROTTLE_LOCK = threading.Lock()
+
+
+def _musicbrainz_user_agent() -> str:
+    # MusicBrainz requires a descriptive User-Agent with contact info.
+    # Override in production via env var.
+    return (
+        os.environ.get("MUSICBRAINZ_USER_AGENT")
+        or "RealTop/1.0 (set MUSICBRAINZ_USER_AGENT; contact: required)"
+    ).strip()
+
+
+def _mb_throttle() -> None:
+    # Basic politeness throttle (MusicBrainz rate limits).
+    global _MB_LAST_CALL_AT
+    with _MB_THROTTLE_LOCK:
+        try:
+            min_interval = float(
+                os.environ.get("MUSICBRAINZ_MIN_INTERVAL_SECONDS") or "1.0"
+            )
+        except ValueError:
+            min_interval = 1.0
+        min_interval = max(0.2, min(10.0, min_interval))
+        now = time.time()
+        wait = (_MB_LAST_CALL_AT + min_interval) - now
+        if wait > 0:
+            time.sleep(min(wait, min_interval + 0.25))
+        _MB_LAST_CALL_AT = time.time()
+
+
+def _caa_throttle() -> None:
+    """Politeness throttle for Cover Art Archive requests."""
+    global _CAA_LAST_CALL_AT
+    with _CAA_THROTTLE_LOCK:
+        try:
+            min_interval = float(os.environ.get("COVERART_MIN_INTERVAL_SECONDS") or "1.0")
+        except ValueError:
+            min_interval = 1.0
+        min_interval = max(0.2, min(10.0, min_interval))
+        now = time.time()
+        wait = (_CAA_LAST_CALL_AT + min_interval) - now
+        if wait > 0:
+            time.sleep(min(wait, min_interval + 0.25))
+        _CAA_LAST_CALL_AT = time.time()
+
+
+def _wikidata_throttle() -> None:
+    """Politeness throttle for Wikidata requests."""
+    global _WIKIDATA_LAST_CALL_AT
+    with _WIKIDATA_THROTTLE_LOCK:
+        try:
+            min_interval = float(os.environ.get("WIKIDATA_MIN_INTERVAL_SECONDS") or "1.0")
+        except ValueError:
+            min_interval = 1.0
+        min_interval = max(0.2, min(10.0, min_interval))
+        now = time.time()
+        wait = (_WIKIDATA_LAST_CALL_AT + min_interval) - now
+        if wait > 0:
+            time.sleep(min(wait, min_interval + 0.25))
+        _WIKIDATA_LAST_CALL_AT = time.time()
+
+
+def _cover_art_url_for_release_group(release_group_mbid: str) -> str | None:
+    mbid = (release_group_mbid or "").strip()
+    if not mbid:
+        return None
+    # Cover Art Archive supports release-group lookup.
+    url = f"https://coverartarchive.org/release-group/{mbid}"
+    headers = {"Accept": "application/json", "User-Agent": _musicbrainz_user_agent()}
+    try:
+        _caa_throttle()
+        resp = requests.get(url, headers=headers, timeout=8)
+    except requests.RequestException:
+        return None
+    if resp.status_code != 200:
+        return None
+    try:
+        data = resp.json()
+    except ValueError:
+        return None
+    images = data.get("images") or []
+    if not images:
+        return None
+    preferred = None
+    for img in images:
+        if img.get("front"):
+            preferred = img
+            break
+    preferred = preferred or images[0]
+    thumbs = preferred.get("thumbnails") or {}
+    return (
+        thumbs.get("1200")
+        or thumbs.get("500")
+        or thumbs.get("250")
+        or thumbs.get("large")
+        or thumbs.get("small")
+        or preferred.get("image")
+        or None
+    )
+
+
+def _cover_art_url_for_release(release_mbid: str) -> str | None:
+    mbid = (release_mbid or "").strip()
+    if not mbid:
+        return None
+    url = f"https://coverartarchive.org/release/{mbid}"
+    headers = {"Accept": "application/json", "User-Agent": _musicbrainz_user_agent()}
+    try:
+        _caa_throttle()
+        resp = requests.get(url, headers=headers, timeout=8)
+    except requests.RequestException:
+        return None
+    if resp.status_code != 200:
+        return None
+    try:
+        data = resp.json()
+    except ValueError:
+        return None
+    images = data.get("images") or []
+    if not images:
+        return None
+    preferred = None
+    for img in images:
+        if img.get("front"):
+            preferred = img
+            break
+    preferred = preferred or images[0]
+    thumbs = preferred.get("thumbnails") or {}
+    return (
+        thumbs.get("1200")
+        or thumbs.get("500")
+        or thumbs.get("250")
+        or thumbs.get("large")
+        or thumbs.get("small")
+        or preferred.get("image")
+        or None
+    )
+
+
+def _cover_art_url_for_recording(recording_mbid: str) -> str | None:
+    mbid = (recording_mbid or "").strip()
+    if not mbid:
+        return None
+
+    # Recordings don't have cover art; fetch a related release and use its cover.
+    url = f"https://musicbrainz.org/ws/2/recording/{mbid}"
+    headers = {"User-Agent": _musicbrainz_user_agent(), "Accept": "application/json"}
+    try:
+        _mb_throttle()
+        resp = requests.get(url, params={"fmt": "json", "inc": "releases"}, headers=headers, timeout=12)
+    except requests.RequestException:
+        return None
+    if resp.status_code != 200:
+        return None
+    try:
+        data = resp.json()
+    except ValueError:
+        return None
+
+    releases = data.get("releases") or []
+    if not releases:
+        return None
+
+    def _release_group_id_for_release(release_id: str) -> str | None:
+        rid = (release_id or "").strip()
+        if not rid:
+            return None
+        url = f"https://musicbrainz.org/ws/2/release/{rid}"
+        headers = {"User-Agent": _musicbrainz_user_agent(), "Accept": "application/json"}
+        try:
+            _mb_throttle()
+            resp = requests.get(
+                url,
+                params={"fmt": "json", "inc": "release-groups"},
+                headers=headers,
+                timeout=12,
+            )
+        except requests.RequestException:
+            return None
+        if resp.status_code != 200:
+            return None
+        try:
+            data = resp.json()
+        except ValueError:
+            return None
+        rg = data.get("release-group") or {}
+        rgid = (rg.get("id") or "").strip()
+        return rgid or None
+
+    # Try a few releases; if no direct release cover exists, fall back to the
+    # album/release-group cover art.
+    for rel in releases[:5]:
+        release_id = (rel.get("id") or "").strip()
+        if not release_id:
+            continue
+        cover = _cover_art_url_for_release(release_id)
+        if cover:
+            return cover
+        rgid = _release_group_id_for_release(release_id)
+        if rgid:
+            cover = _cover_art_url_for_release_group(rgid)
+            if cover:
+                return cover
+
+    return None
+
+
+def _wikidata_qid_from_artist(mbid: str) -> str | None:
+    mbid = (mbid or "").strip()
+    if not mbid:
+        return None
+    url = f"https://musicbrainz.org/ws/2/artist/{mbid}"
+    headers = {"User-Agent": _musicbrainz_user_agent(), "Accept": "application/json"}
+    try:
+        _mb_throttle()
+        resp = requests.get(url, params={"fmt": "json", "inc": "url-rels"}, headers=headers, timeout=12)
+    except requests.RequestException:
+        return None
+    if resp.status_code != 200:
+        return None
+    try:
+        data = resp.json()
+    except ValueError:
+        return None
+
+    rels = data.get("relations") or []
+    for rel in rels:
+        u = (rel.get("url") or {}).get("resource") or ""
+        u = u.strip()
+        if "wikidata.org/wiki/" in u:
+            qid = u.rsplit("/", 1)[-1].strip()
+            if qid.startswith("Q"):
+                return qid
+    return None
+
+
+def _artist_image_url(artist_mbid: str) -> str | None:
+    qid = _wikidata_qid_from_artist(artist_mbid)
+    if not qid:
+        return None
+
+    url = f"https://www.wikidata.org/wiki/Special:EntityData/{qid}.json"
+    headers = {"Accept": "application/json", "User-Agent": _musicbrainz_user_agent()}
+    try:
+        _wikidata_throttle()
+        resp = requests.get(url, headers=headers, timeout=10)
+    except requests.RequestException:
+        return None
+    if resp.status_code != 200:
+        return None
+    try:
+        data = resp.json()
+    except ValueError:
+        return None
+
+    entity = ((data.get("entities") or {}).get(qid) or {})
+    claims = entity.get("claims") or {}
+    p18 = claims.get("P18") or []
+    if not p18:
+        return None
+    mainsnak = (p18[0].get("mainsnak") or {})
+    datavalue = (mainsnak.get("datavalue") or {})
+    filename = (datavalue.get("value") or "")
+    filename = str(filename).strip()
+    if not filename:
+        return None
+
+    # Serve a reasonably high-res version via Commons.
+    try:
+        width = int((os.environ.get("ART_IMAGE_WIDTH") or "1000").strip())
+    except ValueError:
+        width = 1000
+    width = max(200, min(2000, width))
+
+    safe = quote(filename.replace(" ", "_"), safe="")
+    return f"https://commons.wikimedia.org/wiki/Special:FilePath/{safe}?width={width}"
+
+
+def _artist_credit_to_string(credit) -> str:
+    if not credit:
+        return ""
+    parts = []
+    for c in credit:
+        name = (c.get("name") or "").strip()
+        joinphrase = c.get("joinphrase") or ""
+        if name:
+            parts.append(name + joinphrase)
+    return "".join(parts).strip()
+
+
+def _year_from_date(date_str: str | None) -> str:
+    s = (date_str or "").strip()
+    return s[:4] if len(s) >= 4 else ""
+
+
+def _mb_escape_phrase(v: str) -> str:
+    # Escape double quotes for inclusion in a MusicBrainz Lucene phrase query.
+    return (v or "").replace('"', '\\"').strip()
+
+
+def _mb_query_tokens(v: str) -> list[str]:
+    # Normalize punctuation/leet-like characters and keep non-empty terms.
+    # Examples:
+    # - you're -> youre
+    # - A$AP -> asap
+    raw = (v or "").strip().lower()
+    # Keep numbers intact; only normalize special/stylized symbols.
+    # Apostrophes are removed so "you're" becomes "youre" (single token).
+    raw = re.sub(r"[\'`’]", "", raw)
+    char_map = str.maketrans(
+        {
+            "$": "s",
+            "@": "a",
+            "!": "i",
+            "+": " plus ",
+        }
+    )
+    raw = raw.translate(char_map)
+    raw = raw.replace("&", " and ")
+    normalized = re.sub(r"[^\w]+", " ", raw)
+    seen: set[str] = set()
+    out: list[str] = []
+    for token in normalized.split():
+        t = token.strip("_")
+        if not t or t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+    return out[:8]
+
+
+def _mb_field_expr(field: str, text: str) -> str:
+    tokens = _mb_query_tokens(text)
+    if not tokens:
+        return ""
+    return "(" + " AND ".join([f"{field}:{t}*" for t in tokens]) + ")"
+
+
+def _mb_search(kind: str, q: str, *, limit: int, offset: int, artist: str | None = None):
+    kind = (kind or "").strip().lower()
+    q = (q or "").strip()
+    if not q:
+        return [], 0
+    artist = (artist or "").strip()
+
+    endpoint = "artist"
+    key = "artists"
+    kind_label = "Artist"
+    if kind == "album":
+        endpoint = "release-group"
+        key = "release-groups"
+        kind_label = "Album"
+    elif kind == "song":
+        endpoint = "recording"
+        key = "recordings"
+        kind_label = "Song"
+
+    url = f"https://musicbrainz.org/ws/2/{endpoint}"
+
+    title_field = "name"
+    if kind == "song":
+        title_field = "recording"
+    elif kind == "album":
+        title_field = "releasegroup"
+
+    title_expr = _mb_field_expr(title_field, q)
+    artist_expr = _mb_field_expr("artist", artist) if artist else ""
+    queries: list[str] = []
+
+    # 1) Flexible fielded match (word/partial-word), 2) broad fallback.
+    if title_expr and artist_expr and kind in {"song", "album"}:
+        queries.append(f"{title_expr} AND {artist_expr}")
+    elif title_expr:
+        queries.append(title_expr)
+
+    if artist and kind in {"song", "album"}:
+        queries.append(f"{q} {artist}".strip())
+    queries.append(q)
+
+    # De-dupe while preserving order.
+    seen_q: set[str] = set()
+    normalized_queries: list[str] = []
+    for qq in queries:
+        key_q = (qq or "").strip()
+        if not key_q or key_q in seen_q:
+            continue
+        seen_q.add(key_q)
+        normalized_queries.append(key_q)
+
+    headers = {"User-Agent": _musicbrainz_user_agent(), "Accept": "application/json"}
+
+    data = {}
+    raw_items = []
+    total_count = 0
+    for query in normalized_queries:
+        params = {"query": query, "fmt": "json", "limit": int(limit), "offset": int(offset)}
+        _mb_throttle()
+        resp = requests.get(url, params=params, headers=headers, timeout=12)
+        if resp.status_code >= 400:
+            continue
+        data = resp.json()
+        raw_items = data.get(key) or []
+        total_count = int(data.get("count") or 0)
+        if raw_items:
+            break
+
+    if not raw_items and not data:
+        return [], 0
+
+    raw_items = data.get(key) or []
+    total_count = int(data.get("count") or 0)
+
+    out = []
+    for item in raw_items:
+        mbid = item.get("id") or ""
+        features = ""
+        if kind == "artist":
+            title = item.get("name") or ""
+            artist = ""
+            year = _year_from_date(item.get("life-span", {}).get("begin"))
+            dis = item.get("disambiguation") or ""
+        elif kind == "album":
+            title = item.get("title") or ""
+            artist = _artist_credit_to_string(item.get("artist-credit"))
+            year = _year_from_date(item.get("first-release-date"))
+            primary = (item.get("primary-type") or "").strip()
+            dis = primary
+            secondary = item.get("secondary-types") or []
+            sec_clean = [str(s).strip() for s in secondary if str(s).strip()]
+            features = ", ".join(sec_clean)
+        else:  # song
+            title = item.get("title") or ""
+            credits = item.get("artist-credit") or []
+            artist = _artist_credit_to_string(credits)
+            year = _year_from_date(item.get("first-release-date"))
+            dis = ""
+            # For songs, show extra credited artists as features when present.
+            credit_names: list[str] = []
+            for c in credits:
+                if isinstance(c, dict):
+                    n = ((c.get("artist") or {}).get("name") or "").strip()
+                    if n:
+                        credit_names.append(n)
+            if len(credit_names) > 1:
+                features = ", ".join(credit_names[1:])
+
+        score = item.get("score")
+        try:
+            score = int(score) if score is not None else None
+        except (TypeError, ValueError):
+            score = None
+
+        entity_path = endpoint
+        if endpoint == "release-group":
+            entity_path = "release-group"
+        url_out = f"https://musicbrainz.org/{entity_path}/{mbid}" if mbid else None
+
+        out.append(
+            {
+                "title": title,
+                "artist": artist,
+                "year": year,
+                "disambiguation": dis,
+                "score": score,
+                "features": features,
+                "url": url_out,
+                "mbid": mbid,
+                "kind_label": kind_label,
+            }
+        )
+
+    # De-dupe results by (title, artist) and keep first.
+    def _norm(s: str) -> str:
+        return " ".join((s or "").strip().lower().split())
+
+    deduped = []
+    seen: set[tuple[str, str]] = set()
+    for it in out:
+        key = (_norm(it.get("title") or ""), _norm(it.get("artist") or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(it)
+
+    return deduped, total_count
+
+
+@app.route("/api/musicbrainz/search", methods=["GET"])
+def musicbrainz_search_api():
+    q = (request.args.get("q") or "").strip()
+    raw_kind = (request.args.get("kind") or "artist").strip().lower()
+    kind = raw_kind if raw_kind in {"artist", "album", "song"} else "artist"
+    artist = (request.args.get("artist") or "").strip()
+    try:
+        limit = int((request.args.get("limit") or "8").strip())
+    except ValueError:
+        limit = 8
+    limit = max(1, min(20, limit))
+
+    try:
+        items, count = _mb_search(kind, q, limit=limit, offset=0, artist=artist)
+        return jsonify({"ok": True, "kind": kind, "count": count, "items": items})
+    except requests.RequestException:
+        return jsonify({"ok": False, "error": "Something went wrong. Try again."}), 502
+    except ValueError:
+        return jsonify({"ok": False, "error": "Something went wrong. Try again."}), 502
 
 # Home page
 @app.route("/")
@@ -671,6 +1207,283 @@ def charts():
     return render_template("charts.html")
 
 
+@app.route("/api/charts/subjects", methods=["GET"])
+def charts_subjects_api():
+    raw_kind = (request.args.get("kind") or "song").strip().lower()
+    kind = raw_kind if raw_kind in {"song", "album", "artist"} else "song"
+    q = (request.args.get("q") or "").strip()
+    artist = (request.args.get("artist") or "").strip()
+    try:
+        limit = int((request.args.get("limit") or "10").strip())
+    except ValueError:
+        limit = 10
+    limit = max(1, min(50, limit))
+
+    items = search_rated_subjects(kind=kind, q=q, artist=artist, limit=limit)
+    return jsonify({"ok": True, "kind": kind, "items": items})
+
+
+@app.route("/api/charts/subject-activity", methods=["GET"])
+def charts_subject_activity_api():
+    raw_kind = (request.args.get("kind") or "song").strip().lower()
+    kind = raw_kind if raw_kind in {"song", "album", "artist"} else "song"
+    rating_type = {"song": "Song", "album": "Album", "artist": "Artist"}[kind]
+
+    mbid = (request.args.get("mbid") or "").strip() or None
+    name = (request.args.get("name") or "").strip()
+    artist = (request.args.get("artist") or "").strip()
+
+    raw_action = (request.args.get("action") or "rating_create").strip().lower()
+    allowed_actions = {
+        "rating_create",
+        "rating_view",
+        "rating_like",
+        "rating_unlike",
+        "rating_edit",
+        "rating_delete",
+    }
+    action = raw_action if raw_action in allowed_actions else "rating_create"
+
+    raw_days = (request.args.get("days") or "90").strip()
+    try:
+        days = int(raw_days)
+    except ValueError:
+        days = 90
+    days = max(7, min(3650, days))
+    cutoff_iso = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+    if not mbid and not name:
+        return jsonify({"ok": False, "error": "Missing subject"}), 400
+
+    series = get_subject_activity_timeseries(
+        action=action,
+        mbid=mbid,
+        rating_type=rating_type,
+        rating_name=name,
+        content_artist=artist if kind != "artist" else "",
+        cutoff_iso=cutoff_iso,
+    )
+
+    return jsonify(
+        {
+            "ok": True,
+            "kind": kind,
+            "action": action,
+            "days": days,
+            "labels": [p["day"] for p in series],
+            "events": [p["event_count"] for p in series],
+            "users": [p["user_count"] for p in series],
+        }
+    )
+
+
+@app.route("/api/charts/subject-summary", methods=["GET"])
+def charts_subject_summary_api():
+    raw_kind = (request.args.get("kind") or "song").strip().lower()
+    kind = raw_kind if raw_kind in {"song", "album", "artist"} else "song"
+    rating_type = {"song": "Song", "album": "Album", "artist": "Artist"}[kind]
+
+    mbid = (request.args.get("mbid") or "").strip() or None
+    name = (request.args.get("name") or "").strip()
+    artist = (request.args.get("artist") or "").strip()
+
+    if not mbid and not name:
+        return jsonify({"ok": False, "error": "Missing subject"}), 400
+
+    summary = get_subject_overall_summary(
+        mbid=mbid,
+        rating_type=rating_type,
+        rating_name=name,
+        content_artist=artist if kind != "artist" else "",
+    )
+    if not summary:
+        return jsonify({"ok": True, "summary": None})
+
+    return jsonify({"ok": True, "summary": summary})
+
+
+@app.route("/api/sidebar/refresh", methods=["GET"])
+@login_required
+def sidebar_refresh_api():
+    """
+    Returns fresh sidebar blocks (alerts, bulletin, activity) for the current user.
+    Used to refresh sidebar without a full page reload.
+    """
+    next_path = (request.args.get("next") or request.full_path or "/").strip()
+    next_path = _safe_internal_url(next_path, fallback="/")
+
+    # Alerts
+    alerts = get_alerts_for_user(current_user.id, limit=5, include_read=True) or []
+    for a in alerts:
+        a["time_ago"] = _format_time_ago(a.get("created_at") or "")
+    unread_alert_count = int(get_unread_alert_count(current_user.id) or 0)
+
+    # Bulletin
+    bulletins = get_bulletin_feed_for_user(current_user.id, limit=5) or []
+    for p in bulletins:
+        p["time_ago"] = _format_time_ago(p.get("created_at") or "")
+    bulletin_count = int(count_bulletin_feed_for_user(current_user.id) or 0)
+
+    # Activity
+    raw_activities = get_activity_feed_for_user(current_user.id, limit=5) or []
+    activity_count = int(count_activity_feed_for_user(current_user.id) or 0)
+
+    def _activity_text(item: dict) -> str:
+        actor = item.get("actor_username") or ""
+        action = item.get("action") or ""
+        entity_label = item.get("entity_label") or ""
+        metadata = item.get("metadata") or {}
+
+        if action == "follow":
+            return f"@{actor} followed {entity_label or 'a user'}"
+        if action == "unfollow":
+            return f"@{actor} unfollowed {entity_label or 'a user'}"
+        if action == "rating_create":
+            return (
+                f"@{actor} created a rating: {entity_label}"
+                if entity_label
+                else f"@{actor} created a rating"
+            )
+        if action == "rating_edit":
+            return (
+                f"@{actor} edited a rating: {entity_label}"
+                if entity_label
+                else f"@{actor} edited a rating"
+            )
+        if action == "rating_delete":
+            return (
+                f"@{actor} deleted a rating: {entity_label}"
+                if entity_label
+                else f"@{actor} deleted a rating"
+            )
+        if action == "rating_view":
+            return (
+                f"@{actor} viewed a rating: {entity_label}"
+                if entity_label
+                else f"@{actor} viewed a rating"
+            )
+        if action == "rating_like":
+            return (
+                f"@{actor} liked a rating: {entity_label}"
+                if entity_label
+                else f"@{actor} liked a rating"
+            )
+        if action == "rating_unlike":
+            return (
+                f"@{actor} unliked a rating: {entity_label}"
+                if entity_label
+                else f"@{actor} unliked a rating"
+            )
+        if action == "rating_reaction":
+            return (
+                f"@{actor} reacted to a rating: {entity_label}"
+                if entity_label
+                else f"@{actor} reacted to a rating"
+            )
+        if action == "rating_category_upvote":
+            detail = (metadata.get("detail") or "").strip() or "a category"
+            return (
+                f"@{actor} upvoted {detail} on a rating: {entity_label}"
+                if entity_label
+                else f"@{actor} upvoted {detail} on a rating"
+            )
+        if action == "rating_category_downvote":
+            detail = (metadata.get("detail") or "").strip() or "a category"
+            return (
+                f"@{actor} downvoted {detail} on a rating: {entity_label}"
+                if entity_label
+                else f"@{actor} downvoted {detail} on a rating"
+            )
+        if action == "rating_category_unvote":
+            detail = (metadata.get("detail") or "").strip() or "a category"
+            return (
+                f"@{actor} removed their vote on {detail} for a rating: {entity_label}"
+                if entity_label
+                else f"@{actor} removed their vote on {detail} for a rating"
+            )
+        if action == "rating_comment_add":
+            return (
+                f"@{actor} commented on a rating: {entity_label}"
+                if entity_label
+                else f"@{actor} commented on a rating"
+            )
+        if action == "rating_comment_edit":
+            return (
+                f"@{actor} edited a rating comment: {entity_label}"
+                if entity_label
+                else f"@{actor} edited a rating comment"
+            )
+        if action == "rating_comment_delete":
+            return (
+                f"@{actor} deleted a rating comment: {entity_label}"
+                if entity_label
+                else f"@{actor} deleted a rating comment"
+            )
+        if action == "playlist_favorite":
+            return (
+                f"@{actor} favorited a playlist: {entity_label}"
+                if entity_label
+                else f"@{actor} favorited a playlist"
+            )
+        if action == "playlist_unfavorite":
+            return (
+                f"@{actor} unfavorited a playlist: {entity_label}"
+                if entity_label
+                else f"@{actor} unfavorited a playlist"
+            )
+        if action == "bulletin_post":
+            return f"@{actor} posted to the bulletin"
+        if action == "profile_comment_add":
+            return f"@{actor} commented on {entity_label or 'a profile'}"
+        if action == "profile_comment_edit":
+            return f"@{actor} edited a comment on {entity_label or 'a profile'}"
+        if action == "profile_comment_delete":
+            return f"@{actor} deleted a comment on {entity_label or 'a profile'}"
+        if action == "profile_update":
+            return f"@{actor} updated their profile"
+        return f"@{actor}: {action} {entity_label}".strip()
+
+    activities = []
+    for it in raw_activities:
+        activities.append({**it, "text": _activity_text(it)})
+
+    alerts_html = render_template(
+        "_sidebar_alert_items.html",
+        alerts=alerts,
+        next_path=next_path,
+    )
+    bulletin_html = render_template(
+        "_sidebar_bulletin_items.html",
+        bulletins=bulletins,
+        next_path=next_path,
+    )
+    activity_html = render_template(
+        "_sidebar_activity_items.html",
+        activities=activities,
+    )
+
+    return jsonify(
+        {
+            "ok": True,
+            "next": next_path,
+            "alerts": {
+                "unread_count": unread_alert_count,
+                "has_any": bool(alerts),
+                "html": alerts_html,
+            },
+            "bulletin": {
+                "count": bulletin_count,
+                "has_any": bool(bulletins),
+                "html": bulletin_html,
+            },
+            "activity": {
+                "count": activity_count,
+                "has_any": bool(activities),
+                "html": activity_html,
+            },
+        }
+    )
+
 @app.route("/users")
 def users():
     page, per_page, offset = _parse_pagination(default_per_page=20)
@@ -781,6 +1594,12 @@ def activity():
                 if entity_label
                 else f"@{actor} unliked a rating"
             )
+        elif action == "rating_reaction":
+            text = (
+                f"@{actor} reacted to a rating: {entity_label}"
+                if entity_label
+                else f"@{actor} reacted to a rating"
+            )
         elif action == "rating_category_upvote":
             detail = (metadata.get("detail") or "").strip() or "a category"
             text = (
@@ -879,6 +1698,8 @@ def activity():
 def activity_dismiss(activity_id: int):
     next_url = (request.form.get("next") or "").strip()
     dismiss_activity_for_user(current_user.id, int(activity_id))
+    if (request.headers.get("X-Requested-With") or "").lower() == "fetch":
+        return jsonify({"ok": True, "activity_id": int(activity_id)})
     return redirect(_safe_internal_url(next_url, fallback="/activity"))
 
 
@@ -890,6 +1711,8 @@ def activity_clear():
     allowed_tabs = {"all", "users", "artists", "albums", "songs", "genres"}
     tab = raw_tab if raw_tab in allowed_tabs else "all"
     clear_activity_for_user(current_user.id, tab)
+    if (request.headers.get("X-Requested-With") or "").lower() == "fetch":
+        return jsonify({"ok": True, "tab": tab})
     flash("Activity cleared.", "success")
     return redirect(_safe_internal_url(next_url, fallback=f"/activity?tab={tab}"))
 
@@ -1044,6 +1867,23 @@ def bulletin():
         message,
         post_type=post_type,
     )
+    # Notify followers via alerts when a followed user posts.
+    try:
+        followers = get_followers(int(current_user.id), limit=2000, offset=0) or []
+    except Exception:
+        followers = []
+    for f in followers:
+        try:
+            follower_id = int((f or {}).get("user_id"))
+        except (TypeError, ValueError):
+            continue
+        if follower_id == int(current_user.id):
+            continue
+        create_alert(
+            follower_id,
+            f"@{current_user.username} posted to the bulletin",
+            url=f"/bulletin/{int(bulletin_key)}" if bulletin_key else "/bulletin",
+        )
     add_activity(
         current_user.id,
         current_user.username,
@@ -1104,6 +1944,8 @@ def rating_detail(rating_key):
         return redirect(f"/rating/{rating_key}")
 
     rating_image_url = rating[-1] if len(rating) > 13 else None
+    subject_artist = (rating[-2] if len(rating) > 14 else None) or None
+    subject_mbid = (rating[-4] if len(rating) > 16 else None) or None
 
     owner = get_rating_owner(rating_key)
 
@@ -1134,11 +1976,17 @@ def rating_detail(rating_key):
             metadata={"owner": owner},
         )
 
-    percent = random.randint(70, 99)
+    # Percent based on category up/down votes.
+    totals = get_category_vote_totals_for_ratings([int(rating_key)]).get(int(rating_key)) or {}
+    up = int(totals.get("up") or 0)
+    down = int(totals.get("down") or 0)
+    total = up + down
+    percent = int(round((up / total) * 100)) if total > 0 else None
 
-    detail_reactions = {}
-    for category in ("Lyrics", "Beat", "Flow", "Melody", "Cohesive"):
-        detail_reactions[category] = random.sample(REACTION_EMOJIS, k=5)
+    reaction_summary = get_rating_reactions_summary(rating_key)
+    user_reactions = {}
+    if current_user.is_authenticated:
+        user_reactions = get_user_rating_reactions(rating_key, current_user.id)
 
     owner_pic = get_profile_pic_by_username(owner) if owner else None
     if owner_pic and not _pic_exists(owner_pic):
@@ -1150,15 +1998,136 @@ def rating_detail(rating_key):
         rating=rating,
         owner=owner,
         owner_pic=owner_pic,
-        detail_reactions=detail_reactions,
         percent=percent,
         liked=liked,
         rating_image_url=rating_image_url,
+        subject_artist=subject_artist,
+        subject_mbid=subject_mbid,
         category_vote_summary=category_vote_summary,
         user_category_votes=user_category_votes,
         can_category_vote=current_user.is_authenticated,
         comments=comments,
+        reaction_summary=reaction_summary,
+        user_reactions=user_reactions,
+        reaction_emojis=REACTION_EMOJIS,
+        can_react=current_user.is_authenticated,
     )
+
+
+@app.route("/rating/<int:rating_key>/also-rated")
+def rating_also_rated(rating_key: int):
+    rating = get_rating_by_key(rating_key)
+    if not rating:
+        flash("Rating not found.", "error")
+        return redirect("/")
+
+    rating_type = (rating[1] or "").strip()
+    rating_name = (rating[2] or "").strip()
+    mbid = (rating[-4] if len(rating) > 16 else None) or None
+    content_artist = (rating[-2] if len(rating) > 14 else None) or None
+
+    page, per_page, offset = _parse_pagination(default_per_page=20)
+    users = get_users_who_rated_same_subject(
+        exclude_rating_key=int(rating_key),
+        mbid=mbid,
+        rating_type=rating_type,
+        rating_name=rating_name,
+        content_artist=content_artist,
+        limit=per_page + 1,
+        offset=offset,
+    )
+    has_next = len(users) > per_page
+    users = users[:per_page]
+    total = count_users_who_rated_same_subject(
+        exclude_rating_key=int(rating_key),
+        mbid=mbid,
+        rating_type=rating_type,
+        rating_name=rating_name,
+        content_artist=content_artist,
+    )
+
+    return render_template(
+        "also_rated.html",
+        rating_key=rating_key,
+        subject={
+            "type": rating_type,
+            "name": rating_name,
+            "artist": content_artist,
+        },
+        users=users,
+        total_count=total,
+        pagination=_pagination_context(
+            page=page,
+            per_page=per_page,
+            has_next=has_next,
+            item_count=len(users),
+        ),
+    )
+
+
+@app.route("/rating/<int:rating_key>/reactions/toggle", methods=["POST"])
+@login_required
+def rating_toggle_reaction(rating_key: int):
+    rating = get_rating_by_key(rating_key)
+    if not rating:
+        return jsonify({"ok": False, "error": "Rating not found"}), 404
+
+    payload = request.get_json(silent=True) or {}
+    category = (payload.get("category") or "").strip()
+    emoji = (payload.get("emoji") or "").strip()
+
+    allowed_categories = {"Lyrics", "Beat", "Flow", "Melody", "Cohesive"}
+    if category not in allowed_categories:
+        return jsonify({"ok": False, "error": "Invalid category"}), 400
+
+    if emoji not in set(REACTION_EMOJIS):
+        return jsonify({"ok": False, "error": "Invalid emoji"}), 400
+
+    is_present = toggle_rating_reaction(
+        rating_key,
+        current_user.id,
+        category=category,
+        emoji=emoji,
+    )
+
+    # Log an activity item when a user reacts for the first time on this rating.
+    # (Discord-like behavior: don't spam activity on toggles.)
+    if is_present and not activity_exists(
+        actor_user_id=current_user.id,
+        action="rating_reaction",
+        entity_type="rating",
+        entity_id=rating_key,
+    ):
+        rating_type = (rating[1] or "").strip()
+        rating_name = (rating[2] or "").strip()
+        add_activity(
+            current_user.id,
+            current_user.username,
+            action="rating_reaction",
+            category=_category_from_rating_type(rating_type),
+            entity_type="rating",
+            entity_id=rating_key,
+            entity_label=f"{rating_type}: {rating_name}".strip(": "),
+            url=f"/rating/{rating_key}",
+            metadata={"detail": category, "emoji": emoji},
+        )
+
+    summary = get_rating_reactions_summary(rating_key).get(category, [])
+    mine = get_user_rating_reactions(rating_key, current_user.id).get(category, set())
+    reactions_out = []
+    for item in summary:
+        em = (item.get("emoji") or "").strip()
+        if not em:
+            continue
+        reactions_out.append(
+            {
+                "emoji": em,
+                "count": int(item.get("count") or 0),
+                "me": em in mine,
+            }
+        )
+
+    return jsonify({"ok": True, "category": category, "reactions": reactions_out})
 
 
 @app.route("/rating/<int:rating_key>/category-vote", methods=["POST"])
@@ -1166,6 +2135,9 @@ def rating_detail(rating_key):
 def rating_category_vote(rating_key: int):
     rating = get_rating_by_key(rating_key)
     if not rating:
+        # For fetch callers return JSON, otherwise redirect.
+        if (request.headers.get("X-Requested-With") or "").lower() == "fetch":
+            return jsonify({"ok": False, "error": "Rating not found"}), 404
         return redirect(f"/rating/{rating_key}")
 
     category = (request.form.get("category") or "").strip()
@@ -1173,6 +2145,8 @@ def rating_category_vote(rating_key: int):
 
     allowed = {"Lyrics", "Beat", "Flow", "Melody", "Cohesive"}
     if category not in allowed:
+        if (request.headers.get("X-Requested-With") or "").lower() == "fetch":
+            return jsonify({"ok": False, "error": "Invalid category"}), 400
         flash("Invalid category.", "error")
         return _redirect_back(f"/rating/{rating_key}")
 
@@ -1182,6 +2156,8 @@ def rating_category_vote(rating_key: int):
     elif direction == "down":
         vote = -1
     else:
+        if (request.headers.get("X-Requested-With") or "").lower() == "fetch":
+            return jsonify({"ok": False, "error": "Invalid vote"}), 400
         flash("Invalid vote.", "error")
         return _redirect_back(f"/rating/{rating_key}")
 
@@ -1218,6 +2194,20 @@ def rating_category_vote(rating_key: int):
         url=f"/rating/{rating_key}",
         metadata={"detail": category},
     )
+
+    if (request.headers.get("X-Requested-With") or "").lower() == "fetch":
+        summary = get_rating_category_votes_summary(rating_key).get(category, {}) or {}
+        mine = int(
+            (get_user_rating_category_votes(rating_key, current_user.id).get(category) or 0)
+        )
+        return jsonify(
+            {
+                "ok": True,
+                "category": category,
+                "score": int(summary.get("score") or 0),
+                "mine": mine,
+            }
+        )
 
     return _redirect_back(f"/rating/{rating_key}")
 
@@ -1393,6 +2383,9 @@ def add():
     if request.method == "POST":
         rating_type = request.form.get("rating_type", "").strip()
         rating_name = request.form.get("rating_name", "").strip()
+        mbid = (request.form.get("mbid") or "").strip()
+        mb_url = (request.form.get("mb_url") or "").strip()
+        content_artist = (request.form.get("content_artist") or "").strip()
         lyrics_rating = request.form.get("lyrics", "").strip()
         lyrics_reason = request.form.get("lyrics_reason", "").strip()
         beat_rating = request.form.get("beat", "").strip()
@@ -1428,6 +2421,9 @@ def add():
             session["add_form_draft"] = {
                 "rating_type": rating_type,
                 "rating_name": rating_name,
+                "mbid": mbid,
+                "mb_url": mb_url,
+                "content_artist": content_artist,
                 "lyrics": lyrics_rating,
                 "lyrics_reason": lyrics_reason,
                 "beat": beat_rating,
@@ -1451,6 +2447,9 @@ def add():
                 session["add_form_draft"] = {
                     "rating_type": rating_type,
                     "rating_name": rating_name,
+                    "mbid": mbid,
+                    "mb_url": mb_url,
+                    "content_artist": content_artist,
                     "lyrics": lyrics_rating,
                     "lyrics_reason": lyrics_reason,
                     "beat": beat_rating,
@@ -1481,6 +2480,16 @@ def add():
             url_prefix = (current_app.config.get("UPLOAD_URL_PREFIX") or "/uploads").rstrip("/")
             rating_image_url = f"{url_prefix}/ratings/{filename}"
 
+        # If no manual upload provided, try to fetch an image from MusicBrainz-related sources.
+        if not rating_image_url and mbid:
+            rt = (rating_type or "").strip().lower()
+            if rt == "album":
+                rating_image_url = _cover_art_url_for_release_group(mbid) or None
+            elif rt == "song":
+                rating_image_url = _cover_art_url_for_recording(mbid) or None
+            elif rt == "artist":
+                rating_image_url = _artist_image_url(mbid) or None
+
         if rating_type:
             rating_key = add_rating(
                 rating_type,
@@ -1497,6 +2506,9 @@ def add():
                 cohesive_reason,
                 current_user.username,
                 rating_image_url,
+                mbid or None,
+                mb_url or None,
+                content_artist or None,
             )
             category = _category_from_rating_type(rating_type)
             add_activity(
@@ -1611,13 +2623,9 @@ def _render_profile(profile_user):
         profile_user.profile_pic = None
     comments = _build_profile_comments(profile_user.id)
     profile_ratings = get_ratings_by_user(profile_user.username)
-    profile_percent_map = {
-        rating[0]: random.randint(60, 99) for rating in profile_ratings
-    }
+    profile_percent_map = _build_percent_map(profile_ratings)
     favorite_ratings = get_liked_ratings_for_user(profile_user.id, limit=60)
-    favorite_percent_map = {
-        rating[0]: random.randint(60, 99) for rating in favorite_ratings
-    }
+    favorite_percent_map = _build_percent_map(favorite_ratings)
     profile_playlists = get_playlists_by_creator(profile_user.username, limit=200)
     is_owner = current_user.is_authenticated and current_user.id == profile_user.id
     active_follow_tab = request.args.get("follow_tab")
@@ -1732,7 +2740,7 @@ def user_ratings_page(username: str):
     )
     has_next = len(raw_ratings) > per_page
     ratings = raw_ratings[:per_page]
-    percent_map = {rating[0]: random.randint(60, 99) for rating in ratings}
+    percent_map = _build_percent_map(ratings)
     pagination = _pagination_context(
         page=page,
         per_page=per_page,
@@ -1801,7 +2809,7 @@ def user_favorites_page(username: str):
     )
     has_next = len(raw_favorites) > per_page
     favorites = raw_favorites[:per_page]
-    percent_map = {rating[0]: random.randint(60, 99) for rating in favorites}
+    percent_map = _build_percent_map(favorites)
     pagination = _pagination_context(
         page=page,
         per_page=per_page,
@@ -2042,9 +3050,15 @@ def edit(rating_key):
         current_cohesive_rating = rating[11]
         current_cohesive_reason = (rating[12] or "").strip()
         current_image_url = rating[-1] if len(rating) > 13 else None
+        current_mbid = (rating[-4] if len(rating) > 16 else None) or None
+        current_mb_url = (rating[-3] if len(rating) > 16 else None) or None
+        current_content_artist = (rating[-2] if len(rating) > 14 else None) or None
 
         rating_type = request.form.get("rating_type", "").strip()
         rating_name = request.form.get("rating_name", "").strip()
+        mbid = (request.form.get("mbid") or "").strip() or None
+        mb_url = (request.form.get("mb_url") or "").strip() or None
+        content_artist = (request.form.get("content_artist") or "").strip() or None
         lyrics_rating = request.form.get("lyrics", "").strip()
         lyrics_reason = request.form.get("lyrics_reason", "").strip()
         beat_rating = request.form.get("beat", "").strip()
@@ -2084,6 +3098,16 @@ def edit(rating_key):
             url_prefix = (current_app.config.get("UPLOAD_URL_PREFIX") or "/uploads").rstrip("/")
             rating_image_url = f"{url_prefix}/ratings/{filename}"
 
+        # If no manual upload provided, try to fetch an image from MusicBrainz-related sources.
+        if not rating_image_url and mbid:
+            rt = (rating_type or "").strip().lower()
+            if rt == "album":
+                rating_image_url = _cover_art_url_for_release_group(mbid) or None
+            elif rt == "song":
+                rating_image_url = _cover_art_url_for_recording(mbid) or None
+            elif rt == "artist":
+                rating_image_url = _artist_image_url(mbid) or None
+
         def _to_int(v):
             try:
                 return int(v)
@@ -2105,6 +3129,9 @@ def edit(rating_key):
                 _to_int(cohesive_rating) != _to_int(current_cohesive_rating),
                 (cohesive_reason or "").strip() != current_cohesive_reason,
                 (rating_image_url or None) != (current_image_url or None),
+                (mbid or None) != (current_mbid or None),
+                (mb_url or None) != (current_mb_url or None),
+                (content_artist or None) != (current_content_artist or None),
             ]
         )
 
@@ -2127,6 +3154,9 @@ def edit(rating_key):
                 cohesive_rating,
                 cohesive_reason,
                 rating_image_url,
+                mbid,
+                mb_url,
+                content_artist,
             )
             category = _category_from_rating_type(rating_type)
             add_activity(
@@ -2195,17 +3225,62 @@ def _category_from_rating_type(rating_type: str) -> str:
 # Source for emojis: https://getemoji.com/
 REACTION_EMOJIS = [
     "👍",
+    "👌",
+    "🙌",
+    "🤝",
+    "💯",
     "❤️",
+    "🖤",
+    "💔",
+    "💙",
+    "💜",
+    "💚",
+    "🤍",
+    "🧡",
+    "💛",
     "😂",
+    "🤣",
+    "😭",
+    "🥲",
+    "😅",
     "😮",
+    "🤯",
+    "😳",
+    "😱",
     "😢",
+    "😤",
+    "😮‍💨",
     "😡",
+    "🤬",
     "🔥",
+    "🥵",
+    "🥶",
+    "⚡",
+    "💥",
     "👏",
+    "🎶",
+    "🎵",
+    "🎧",
+    "🔊",
+    "🔁",
     "🎉",
+    "✨",
+    "🌟",
+    "💫",
     "🤔",
+    "🧠",
+    "🧐",
+    "🤨",
     "👎",
+    "👀",
+    "🙏",
+    "🫡",
     "⭐",
+    "🏆",
+    "🥇",
+    "📌",
+    "📝",
+    "🗑️",
 ]
 
 
@@ -2214,13 +3289,44 @@ def _build_reactions_map(ratings):
     if not ratings:
         return reactions_map
 
-    current_username = current_user.username if current_user.is_authenticated else None
+    rating_keys: list[int] = []
     for rating in ratings:
-        rating_key = rating[0]
-        owner_username = rating[8]
-        if current_username and owner_username == current_username:
+        try:
+            rating_keys.append(int(rating[0]))
+        except (TypeError, ValueError, IndexError):
             continue
-        reactions_map[rating_key] = random.sample(REACTION_EMOJIS, k=5)
+
+    counts_map = get_reaction_counts_for_ratings(rating_keys)
+
+    for rk in rating_keys:
+        counts = counts_map.get(int(rk), []) or []
+        if not counts:
+            reactions_map[int(rk)] = []
+            continue
+
+        # Pick top 5 emojis by count; if tied, randomize within the tie.
+        groups: dict[int, list[str]] = {}
+        for emoji, c in counts:
+            try:
+                cnt = int(c)
+            except (TypeError, ValueError):
+                cnt = 0
+            groups.setdefault(cnt, []).append(str(emoji))
+
+        picked: list[str] = []
+        for cnt in sorted(groups.keys(), reverse=True):
+            bucket = groups.get(cnt) or []
+            random.shuffle(bucket)
+            for em in bucket:
+                if not em:
+                    continue
+                picked.append(em)
+                if len(picked) >= 5:
+                    break
+            if len(picked) >= 5:
+                break
+
+        reactions_map[int(rk)] = picked
     return reactions_map
 
 
@@ -2229,17 +3335,20 @@ def _build_percent_map(ratings):
     if not ratings:
         return percent_map
 
-    current_username = current_user.username if current_user.is_authenticated else None
-
+    rating_keys: list[int] = []
     for rating in ratings:
-        rating_key = rating[0]
-        owner_username = rating[8]
-
-        if current_username and owner_username == current_username:
+        try:
+            rating_keys.append(int(rating[0]))
+        except (TypeError, ValueError, IndexError):
             continue
 
-        # Random percent
-        percent_map[rating_key] = random.randint(60, 99)
+    totals_map = get_category_vote_totals_for_ratings(rating_keys)
+    for rk in rating_keys:
+        totals = totals_map.get(int(rk)) or {}
+        up = int(totals.get("up") or 0)
+        down = int(totals.get("down") or 0)
+        total = up + down
+        percent_map[int(rk)] = int(round((up / total) * 100)) if total > 0 else None
 
     return percent_map
 

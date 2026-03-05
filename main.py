@@ -6,5 +6,30 @@ app = create_app()
 # Runs the app
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8000"))
-    debug = (os.environ.get("FLASK_DEBUG") or "").strip() in {"1", "true", "True"}
+
+    def _is_render() -> bool:
+        # Render sets one or more of these env vars.
+        return any(
+            (os.environ.get(k) or "").strip()
+            for k in (
+                "RENDER",
+                "RENDER_SERVICE_ID",
+                "RENDER_EXTERNAL_URL",
+                "RENDER_GIT_COMMIT",
+            )
+        )
+
+    def _env_bool(key: str):
+        raw = os.environ.get(key)
+        if raw is None:
+            return None
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+    # Default behavior:
+    # - Local dev: debug on (auto-reload)
+    # - Render: debug off
+    debug = _env_bool("FLASK_DEBUG")
+    if debug is None:
+        debug = False if _is_render() else True
+
     app.run(host="0.0.0.0", port=port, debug=debug)

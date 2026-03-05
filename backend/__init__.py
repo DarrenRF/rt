@@ -243,6 +243,12 @@ def create_app():
                     if entity_label
                     else f"@{actor} unliked a rating"
                 )
+            elif action == "rating_reaction":
+                text = (
+                    f"@{actor} reacted to a rating: {entity_label}"
+                    if entity_label
+                    else f"@{actor} reacted to a rating"
+                )
             elif action == "rating_category_upvote":
                 detail = (metadata.get("detail") or "").strip() or "a category"
                 text = (

@@ -66,6 +66,8 @@ def init_db():
     )
 
     _ensure_column("ratings", "image_url", "image_url TEXT")
+    _ensure_column("ratings", "mbid", "mbid TEXT")
+    _ensure_column("ratings", "mb_url", "mb_url TEXT")
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS "album" (
@@ -199,6 +201,20 @@ def init_db():
 
     cur.execute(
         """
+        CREATE TABLE IF NOT EXISTS rating_reactions (
+        reaction_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        rating_key INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        category TEXT NOT NULL,
+        emoji TEXT NOT NULL,
+        created_at TEXT,
+        UNIQUE(rating_key, user_id, category, emoji)
+        )
+        """
+    )
+
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS rating_comments (
         comment_id INTEGER PRIMARY KEY AUTOINCREMENT,
         rating_key INTEGER NOT NULL,
@@ -220,6 +236,13 @@ def init_db():
         """
         CREATE INDEX IF NOT EXISTS idx_rating_category_votes_rating
         ON rating_category_votes (rating_key)
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_rating_reactions_rating_category
+        ON rating_reactions (rating_key, category)
         """
     )
 
